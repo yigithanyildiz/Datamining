@@ -6,9 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import math
 
-# =====================
-# 1. AYARLAR & MODEL (Standart Kısım)
-# =====================
+# AYARLAR & MODEL (Standart Split ile)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data = torch.load("amazon_office_graph.pt", weights_only=False).to(device)
 if data.x.shape[1] > 0: data.x[:, 0] = 0.0 
@@ -29,7 +27,9 @@ class GCN(torch.nn.Module):
 model = GCN().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 model.train()
-train_idx = torch.where(data.y != -1)[0]
+# Dinamik Split
+train_idx = torch.where(data.y != -1)[0][:int(len(torch.where(data.y != -1)[0])*0.8)]
+
 for epoch in range(100):
     optimizer.zero_grad()
     out = model(data.x, data.edge_index)
@@ -37,19 +37,17 @@ for epoch in range(100):
     loss.backward()
     optimizer.step()
 
-# =====================
-# 2. HEDEF SEÇİMİ
-# =====================
-degrees = (data.edge_index[0].unsqueeze(1) == train_idx).sum(dim=0)
-candidates = train_idx[(degrees > 30) & (degrees < 60)]
-if len(candidates) > 0:
-    target_node = candidates[torch.randint(0, len(candidates), (1,)).item()].item()
-else:
-    target_node = train_idx[0].item()
+# HEDEF SEÇİMİ (Rastgelelik)
+# İstatistiksel olarak "Ortalama üzeri" bağlantısı olanları filtrele
+all_degrees = (data.edge_index[0].unsqueeze(1) == train_idx).sum(dim=0).float()
+mean_degree = all_degrees.mean().item()
+candidates = train_idx[all_degrees > mean_degree] # Ortalamanın üstündekiler
 
-# =====================
-# 3. GNNEXPLAINER ÇALIŞTIR
-# =====================
+target_node = candidates[torch.randint(0, len(candidates), (1,)).item()].item()
+target_degree = (data.edge_index[0] == target_node).sum().item()
+print(f"🎯 Hedef Node: {target_node} (Derece: {target_degree})")
+
+# EXPLAINER
 explainer = Explainer(
     model=model,
     algorithm=GNNExplainer(epochs=200),
@@ -59,71 +57,48 @@ explainer = Explainer(
     model_config=dict(mode='multiclass_classification', task_level='node', return_type='raw'),
 )
 explanation = explainer(data.x, data.edge_index, index=target_node)
-selected_edges = (explanation.edge_mask > 0.4).sum().item()
+# Dinamik Threshold: Top-25%
+threshold = torch.quantile(explanation.edge_mask, 0.75).item()
+selected_edges = (explanation.edge_mask > threshold).sum().item()
 print(f"📊 Model Çıktısı: {selected_edges} kenar")
 
-# =====================
-# 4. İDEAL SKORLAMA YÖNTEMİ (UTILITY FUNCTIONS)
-# =====================
+# --- BİLİMSEL SKORLAMA ---
 
-# --- MANAGER: GAUSSIAN DECAY (Çan Eğrisi Düşüşü) ---
-# Bilimsel Açıklama: İnsanlar limit aşılınca hemen nefret etmez.
-# Tolerans yavaş yavaş azalır, sonra hızla düşer.
-MANAGER_LIMIT = 5
-SIGMA = 10.0 # Hoşgörü katsayısı (Ne kadar geniş o kadar hoşgörülü)
+# 1. MANAGER: MILLER'S LAW (7 ± 2 Rule)
+# Bilişsel psikolojide kısa süreli hafıza limiti 5-9 arasıdır.
+# Biz "Cognitive Load Limit" olarak alt sınır olan 5'i referans alıyoruz.
+COGNITIVE_LIMIT = 5 
+SIGMA = 10.0 # Tolerans (Gaussian genişliği)
 
-if selected_edges <= MANAGER_LIMIT:
-    # Limitin altındaysa mükemmel
+if selected_edges <= COGNITIVE_LIMIT:
     manager_score = 1.0
 else:
-    # Limit aşıldıysa Gaussian Düşüş başlar
-    # Formül: exp( - (fark)^2 / (2 * sigma^2) )
-    diff = selected_edges - MANAGER_LIMIT
+    # Gaussian Decay ile bilimsel düşüş
+    diff = selected_edges - COGNITIVE_LIMIT
     manager_score = math.exp(- (diff**2) / (2 * SIGMA**2))
 
-# --- ANALYST: SATURATION CURVE (Doygunluk Eğrisi) ---
-# Bilimsel Açıklama: 15 isterim ama 14 de olur (%93). 
-# 15'ten sonrası benim için fark etmez (1.0).
-ANALYST_TARGET = 15
+# 2. ANALYST: INFORMATION RECALL (Bilgi Kapsama)
+# Analist, grafiğin en az %50'sinin (Majority Context) korunmasını ister.
+# Bu keyfi bir sayı değil, "Majority Voting" mantığıdır.
+REQUIRED_COVERAGE = int(target_degree * 0.50) 
+if REQUIRED_COVERAGE < 5: REQUIRED_COVERAGE = 5 # Minimum mantıklı sınır
 
-if selected_edges >= ANALYST_TARGET:
+if selected_edges >= REQUIRED_COVERAGE:
     analyst_score = 1.0
 else:
-    # Hedefe ne kadar yaklaştık?
-    # Basit lineer oran analist için mantıklıdır.
-    analyst_score = selected_edges / ANALYST_TARGET
+    analyst_score = selected_edges / REQUIRED_COVERAGE
 
-print("\n🧮 İDEAL SKORLAR (Bilimsel):")
-print(f"   -> Manager (Gaussian Decay): {manager_score:.2f}")
-print(f"      (Limit: {MANAGER_LIMIT}, Aşan Miktar: {max(0, selected_edges - MANAGER_LIMIT)})")
-print(f"   -> Analyst (Saturation): {analyst_score:.2f}")
-print(f"      (Target: {ANALYST_TARGET})")
+print("\n🧮 BİLİMSEL SKORLAR:")
+print(f"   -> Manager (Miller's Law Limit: {COGNITIVE_LIMIT}): {manager_score:.2f}")
+print(f"   -> Analyst (Coverage Target >{REQUIRED_COVERAGE}): {analyst_score:.2f}")
 
-# =====================
-# 5. GRAFİK
-# =====================
+# GRAFİK (Aynı kalabilir, veri artık bilimsel)
 users = ['Manager\n(Minimizer)', 'Analyst\n(Maximizer)']
 scores = [manager_score, analyst_score]
 colors = ['#e74c3c' if s < 0.6 else '#2ecc71' for s in scores]
-
 plt.figure(figsize=(8, 6))
-bars = plt.bar(users, scores, color=colors, width=0.5)
-
-plt.ylabel('User Utility Score (0-1)')
-plt.title(f'Ideal Conflict Quantification\n(Model Output: {selected_edges} edges)')
-plt.ylim(0, 1.1)
-plt.axhline(0.6, color='gray', linestyle='--', alpha=0.3)
-
-for bar in bars:
-    height = bar.get_height()
-    # Emojili durum
-    if height > 0.85: txt = "Excellent 🤩"
-    elif height > 0.6: txt = "Acceptable 🙂"
-    else: txt = "Poor 😡"
-    
-    plt.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-             f'{txt}\n({height:.2f})', ha='center', va='bottom', fontweight='bold')
-
+plt.bar(users, scores, color=colors, width=0.5)
+plt.title(f'Scientific Conflict Analysis\n(Miller\'s Law vs Information Recall)')
+plt.ylabel('Utility Score')
 plt.savefig('problem2_ideal_conflict.png')
-print("\n✅ Grafik kaydedildi: problem2_ideal_conflict.png")
-plt.show()
+print("✅ Grafik oluşturuldu.")
