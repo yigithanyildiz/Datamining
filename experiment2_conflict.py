@@ -3,47 +3,34 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.explain import Explainer, GNNExplainer
 import matplotlib.pyplot as plt
-import networkx as nx
-from torch_geometric.utils import to_networkx, k_hop_subgraph
+import numpy as np
+import math
 
 # =====================
-# 1. AYARLAR & YÜKLEME
+# 1. AYARLAR & MODEL (Standart Kısım)
 # =====================
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-data = torch.load("amazon_office_graph.pt", weights_only=False)
-data = data.to(device)
-
-if data.x.shape[1] > 0:
-    data.x[:, 0] = 0.0  # Feature Leakage Önlemi
-
+data = torch.load("amazon_office_graph.pt", weights_only=False).to(device)
+if data.x.shape[1] > 0: data.x[:, 0] = 0.0 
 num_features = data.x.shape[1]
 num_classes = 2
 
-# =====================
-# 2. MODELİ KUR (Eğitilmiş Halini Varsayıyoruz)
-# =====================
 class GCN(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.conv1 = GCNConv(num_features, 64)
         self.conv2 = GCNConv(64, 32)
         self.conv3 = GCNConv(32, num_classes)
-
     def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        x = self.conv3(x, edge_index)
-        return x
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        return self.conv3(x, edge_index)
 
 model = GCN().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-# Hızlı tekrar eğitim
 model.train()
-user_mask = data.y != -1
-train_idx = torch.where(user_mask)[0][:1000]
-for epoch in range(80):
+train_idx = torch.where(data.y != -1)[0]
+for epoch in range(100):
     optimizer.zero_grad()
     out = model(data.x, data.edge_index)
     loss = F.cross_entropy(out[train_idx], data.y[train_idx])
@@ -51,12 +38,18 @@ for epoch in range(80):
     optimizer.step()
 
 # =====================
-# 3. HEDEF NODE ANALİZİ (Node 677)
+# 2. HEDEF SEÇİMİ
 # =====================
-# Senin loglarında bulduğun 'Degree 89' olan node'u kullanalım
-target_node = 677 
-print(f"🎯 Hedef Node: {target_node} inceleniyor...")
+degrees = (data.edge_index[0].unsqueeze(1) == train_idx).sum(dim=0)
+candidates = train_idx[(degrees > 30) & (degrees < 60)]
+if len(candidates) > 0:
+    target_node = candidates[torch.randint(0, len(candidates), (1,)).item()].item()
+else:
+    target_node = train_idx[0].item()
 
+# =====================
+# 3. GNNEXPLAINER ÇALIŞTIR
+# =====================
 explainer = Explainer(
     model=model,
     algorithm=GNNExplainer(epochs=200),
@@ -65,75 +58,72 @@ explainer = Explainer(
     edge_mask_type='object',
     model_config=dict(mode='multiclass_classification', task_level='node', return_type='raw'),
 )
-
 explanation = explainer(data.x, data.edge_index, index=target_node)
-
-# Seçilen Önemli Kenarlar (Threshold > 0.5)
-mask = explanation.edge_mask
-selected_edges_count = (mask > 0.5).sum().item()
-total_neighbors = (data.edge_index[0] == target_node).sum().item() # Doğrudan komşular
-
-print(f"\n📊 GNNExplainer Sonuçları:")
-print(f"Toplam Komşu Sayısı: {total_neighbors}")
-print(f"Önemli Diye Seçilen Kenar Sayısı: {selected_edges_count}")
+selected_edges = (explanation.edge_mask > 0.4).sum().item()
+print(f"📊 Model Çıktısı: {selected_edges} kenar")
 
 # =====================
-# 4. USER REQUIREMENT CONFLICT ANALİZİ
+# 4. İDEAL SKORLAMA YÖNTEMİ (UTILITY FUNCTIONS)
 # =====================
-# Senaryo:
-# Manager: En fazla 5 kenar okuyabilir. (Sparsity odaklı)
-# Analyst: Tüm detayları ister. (Fidelity odaklı)
 
-manager_limit = 5
-analyst_limit = 50
+# --- MANAGER: GAUSSIAN DECAY (Çan Eğrisi Düşüşü) ---
+# Bilimsel Açıklama: İnsanlar limit aşılınca hemen nefret etmez.
+# Tolerans yavaş yavaş azalır, sonra hızla düşer.
+MANAGER_LIMIT = 5
+SIGMA = 10.0 # Hoşgörü katsayısı (Ne kadar geniş o kadar hoşgörülü)
 
-print("\n⚡ KULLANICI ÇATIŞMASI ANALİZİ (User Conflict Test):")
-
-# Manager Memnuniyeti
-if selected_edges_count > manager_limit:
-    print(f"❌ MANAGER: 'Bu açıklama çok karışık! Ben max {manager_limit} istedim, sen {selected_edges_count} verdin.'")
-    print("   -> Manager Satisfaction: DÜŞÜK")
+if selected_edges <= MANAGER_LIMIT:
+    # Limitin altındaysa mükemmel
+    manager_score = 1.0
 else:
-    print(f"✅ MANAGER: 'Teşekkürler, {selected_edges_count} kenar tam bana göre.'")
+    # Limit aşıldıysa Gaussian Düşüş başlar
+    # Formül: exp( - (fark)^2 / (2 * sigma^2) )
+    diff = selected_edges - MANAGER_LIMIT
+    manager_score = math.exp(- (diff**2) / (2 * SIGMA**2))
 
-# Analyst Memnuniyeti
-if selected_edges_count > 10:
-    print(f"✅ ANALYST: 'Güzel, {selected_edges_count} kenar ile detaylı bir analiz yapabilirim.'")
-    print("   -> Analyst Satisfaction: YÜKSEK")
+# --- ANALYST: SATURATION CURVE (Doygunluk Eğrisi) ---
+# Bilimsel Açıklama: 15 isterim ama 14 de olur (%93). 
+# 15'ten sonrası benim için fark etmez (1.0).
+ANALYST_TARGET = 15
+
+if selected_edges >= ANALYST_TARGET:
+    analyst_score = 1.0
 else:
-    print(f"❌ ANALYST: 'Bu ne? Sadece {selected_edges_count} kenar var, detaylar kaybolmuş!'")
+    # Hedefe ne kadar yaklaştık?
+    # Basit lineer oran analist için mantıklıdır.
+    analyst_score = selected_edges / ANALYST_TARGET
+
+print("\n🧮 İDEAL SKORLAR (Bilimsel):")
+print(f"   -> Manager (Gaussian Decay): {manager_score:.2f}")
+print(f"      (Limit: {MANAGER_LIMIT}, Aşan Miktar: {max(0, selected_edges - MANAGER_LIMIT)})")
+print(f"   -> Analyst (Saturation): {analyst_score:.2f}")
+print(f"      (Target: {ANALYST_TARGET})")
 
 # =====================
-# 5. GRAFİK: TEK TİP ÇÖZÜMÜN SORUNU
+# 5. GRAFİK
 # =====================
-# Bu grafik, tek bir explanation'ın (GNNExplainer çıktısının) 
-# farklı kullanıcıları nasıl tatmin edemediğini gösterir.
-
-users = ['Manager\n(İster: <5 Edge)', 'Analyst\n(İster: >10 Edge)', 'Customer\n(İster: Basit)']
-# Skorlama mantığı (Basit simülasyon)
-# Explanation size (örneğin 20) Manager için kötü (0.2), Analyst için iyi (0.9)
-size = selected_edges_count
-
-# Basit bir memnuniyet fonksiyonu uyduralım
-manager_score = max(0, 1 - (size - 5)/20) if size > 5 else 1.0
-analyst_score = min(1.0, size / 15)
-customer_score = max(0, 1 - (size - 3)/10) if size > 3 else 1.0
-
-scores = [manager_score, analyst_score, customer_score]
+users = ['Manager\n(Minimizer)', 'Analyst\n(Maximizer)']
+scores = [manager_score, analyst_score]
+colors = ['#e74c3c' if s < 0.6 else '#2ecc71' for s in scores]
 
 plt.figure(figsize=(8, 6))
-bars = plt.bar(users, scores, color=['#e74c3c', '#2ecc71', '#f1c40f'])
-plt.ylabel('Kullanıcı Memnuniyet Skoru (0-1)')
-plt.title(f'Problem 2: User Requirement Conflict\n(Explanation Size: {size} Edges)')
+bars = plt.bar(users, scores, color=colors, width=0.5)
+
+plt.ylabel('User Utility Score (0-1)')
+plt.title(f'Ideal Conflict Quantification\n(Model Output: {selected_edges} edges)')
 plt.ylim(0, 1.1)
+plt.axhline(0.6, color='gray', linestyle='--', alpha=0.3)
 
 for bar in bars:
     height = bar.get_height()
+    # Emojili durum
+    if height > 0.85: txt = "Excellent 🤩"
+    elif height > 0.6: txt = "Acceptable 🙂"
+    else: txt = "Poor 😡"
+    
     plt.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-             f'{height:.2f}', ha='center', va='bottom', fontweight='bold')
+             f'{txt}\n({height:.2f})', ha='center', va='bottom', fontweight='bold')
 
-plt.axhline(y=0.5, color='gray', linestyle='--')
-plt.savefig('problem2_user_conflict.png')
-print("\n✅ Grafik kaydedildi: problem2_user_conflict.png")
-print("Bu grafik, GNNExplainer'ın Analyst'i mutlu ederken Manager'ı mutsuz ettiğini kanıtlar.")
+plt.savefig('problem2_ideal_conflict.png')
+print("\n✅ Grafik kaydedildi: problem2_ideal_conflict.png")
 plt.show()

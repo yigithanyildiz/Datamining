@@ -58,7 +58,7 @@ def get_edges(node_idx, seed):
     torch.manual_seed(seed)
     explainer = Explainer(
         model=model,
-        algorithm=GNNExplainer(epochs=100), # Daha az epoch = daha çok kararsızlık
+        algorithm=GNNExplainer(epochs=10), # Daha az epoch = daha çok kararsızlık
         explanation_type='model',
         node_mask_type='attributes',
         edge_mask_type='object',
