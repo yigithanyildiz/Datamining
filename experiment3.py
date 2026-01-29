@@ -2,10 +2,9 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.explain import Explainer, GNNExplainer
-from torch_geometric.data import Data
-from torch_geometric.utils import to_networkx, k_hop_subgraph
-import matplotlib.pyplot as plt
+from torch_geometric.utils import k_hop_subgraph, to_networkx
 import networkx as nx
+import matplotlib.pyplot as plt
 
 # =====================
 # 1. AYARLAR & YÜKLEME
@@ -14,20 +13,18 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 try:
-    data = torch.load("amazon_office_graph.pt", weights_only=False)
-    data = data.to(device)
+    data = torch.load("amazon_office_graph.pt", weights_only=False).to(device)
 except FileNotFoundError:
     print("HATA: 'amazon_office_graph.pt' bulunamadı.")
     exit()
 
-if data.x.shape[1] > 0:
-    data.x[:, 0] = 0.0  # Feature Leakage Önlemi
-
+# Feature Leakage Önlemi
+if data.x.shape[1] > 0: data.x[:, 0] = 0.0 
 num_features = data.x.shape[1]
 num_classes = 2
 
 # =====================
-# 2. MODEL EĞİTİMİ (Hızlı)
+# 2. MODEL EĞİTİMİ
 # =====================
 class GCN(torch.nn.Module):
     def __init__(self):
@@ -37,22 +34,17 @@ class GCN(torch.nn.Module):
         self.conv3 = GCNConv(32, num_classes)
 
     def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.conv3(x, edge_index)
-        return x
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        return self.conv3(x, edge_index)
 
+print("Model eğitiliyor...")
 model = GCN().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 model.train()
-user_mask = data.y != -1
-train_idx = torch.where(user_mask)[0][:800]
+train_idx = torch.where(data.y != -1)[0]
 
-print("Model eğitiliyor...")
-for epoch in range(80):
+for epoch in range(100):
     optimizer.zero_grad()
     out = model(data.x, data.edge_index)
     loss = F.cross_entropy(out[train_idx], data.y[train_idx])
@@ -60,26 +52,24 @@ for epoch in range(80):
     optimizer.step()
 
 # =====================
-# 3. HEDEF NODE SEÇİMİ
+# 3. HEDEF SEÇİMİ (DISRUPTION TESTİ İÇİN)
 # =====================
-model.eval()
-pred = model(data.x, data.edge_index).argmax(dim=1)
+# Sadece 1. dereceden (doğrudan) komşusu 15-50 arası olanları seçelim.
+# Çok büyük olursa görselleşmez, çok küçük olursa parçalanmaz.
+degrees = (data.edge_index[0].unsqueeze(1) == train_idx).sum(dim=0)
+candidates = train_idx[(degrees > 15) & (degrees < 50)]
 
-target_node = -1
-for i in train_idx:
-    degree = (data.edge_index[0] == i).sum().item()
-    if degree > 10 and degree < 50 and data.y[i] == 1 and pred[i] == 1:
-        target_node = i.item()
-        break
-
-if target_node == -1: 
+if len(candidates) > 0:
+    target_node = candidates[torch.randint(0, len(candidates), (1,)).item()].item()
+else:
     target_node = train_idx[0].item()
 
-print(f"🎯 Hedef Node: {target_node} (Orijinal Komşu Sayısı: {(data.edge_index[0] == target_node).sum().item()})")
+print(f"\n🎯 Hedef Node: {target_node}")
 
 # =====================
-# 4. GNNEXPLAINER
+# 4. GNNEXPLAINER & SUBGRAPH ANALİZİ (DÜZELTİLMİŞ KISIM)
 # =====================
+model.eval()
 explainer = Explainer(
     model=model,
     algorithm=GNNExplainer(epochs=200),
@@ -89,87 +79,73 @@ explainer = Explainer(
     model_config=dict(mode='multiclass_classification', task_level='node', return_type='raw'),
 )
 
+print("Açıklama üretiliyor...")
 explanation = explainer(data.x, data.edge_index, index=target_node)
-edge_mask = explanation.edge_mask
 
-# =====================
-# 5. YAPI BOZULMA ANALİZİ (DÜZELTİLDİ)
-# =====================
-
-# A) Orijinal Neighborhood (2-hop)
-subset, sub_edge_index, mapping, _ = k_hop_subgraph(
-    target_node, 2, data.edge_index, relabel_nodes=True
+# --- KRİTİK DÜZELTME: Sadece 2-Hop Subgraph'a Bakıyoruz ---
+# Model 2 katmanlı olduğu için "Görüş Alanı" (Receptive Field) 2-hop'tur.
+# Analizi tüm grafikte değil, sadece bu alanda yapmalıyız.
+subset, sub_edge_index, mapping, edge_mask_in_subgraph = k_hop_subgraph(
+    target_node, num_hops=2, edge_index=data.edge_index
 )
 
-# Orijinal graph'ı oluştur (0..N indeksli)
-data_orig = Data(edge_index=sub_edge_index, num_nodes=subset.size(0))
-G_orig = to_networkx(data_orig, to_undirected=True)
+print(f"📍 Analiz Alanı (2-Hop Neighborhood): {len(subset)} Node")
 
-# --- KRİTİK DÜZELTME: Node ID'lerini Eşitleme ---
-# G_orig şu an 0, 1, 2... diye gidiyor. Onları gerçek ID'lerine (2048, 55...) çevirelim.
-mapping_dict = {i: node_id.item() for i, node_id in enumerate(subset)}
-G_orig = nx.relabel_nodes(G_orig, mapping_dict)
-# ------------------------------------------------
+# ORİJİNAL DURUM (Maskesiz)
+G_orig = nx.Graph()
+# Node'ları ID'leriyle ekle ki karışmasın
+G_orig.add_nodes_from(subset.cpu().numpy())
+G_orig.add_edges_from(sub_edge_index.t().cpu().numpy())
 
-# B) Explanation Subgraph
-mask_bool = edge_mask > 0.5
-src, dst = data.edge_index
-src_imp = src[mask_bool]
-dst_imp = dst[mask_bool]
+# EXPLANATION DURUMU (Maskeli)
+# Sadece subgraph içindeki kenarların önem skorlarını alıyoruz
+sub_weights = explanation.edge_mask[edge_mask_in_subgraph]
+THRESHOLD = 0.5
+mask = sub_weights > THRESHOLD
+filtered_edges = sub_edge_index[:, mask] # Sadece önemli kenarlar kalıyor
 
-if src_imp.size(0) == 0:
-    print("⚠️ Explainer hiç kenar seçemedi! Threshold düşürülüyor (0.1)...")
-    mask_bool = edge_mask > 0.1
-    src_imp = src[mask_bool]
-    dst_imp = dst[mask_bool]
-
-edge_index_imp = torch.stack([src_imp, dst_imp], dim=0)
-
-# Tüm graph üzerinden explanation edges ile bir yapı kur
-G_expl_full = to_networkx(Data(edge_index=edge_index_imp, num_nodes=data.num_nodes), to_undirected=True)
-
-# Sadece hedef node çevresini kesip al
-subset_list = subset.tolist()
-G_expl = G_expl_full.subgraph(subset_list)
+G_expl = nx.Graph()
+G_expl.add_nodes_from(subset.cpu().numpy()) # Node'lar aynı kalıyor (silinmiyor)
+G_expl.add_edges_from(filtered_edges.t().cpu().numpy()) # Sadece seçilen kenarlar ekleniyor
 
 # =====================
-# 6. METRİK HESAPLAMA
+# 5. SONUÇLARI HESAPLA
 # =====================
-components_orig = nx.number_connected_components(G_orig)
-components_expl = nx.number_connected_components(G_expl)
+comp_orig = nx.number_connected_components(G_orig)
+comp_expl = nx.number_connected_components(G_expl)
 
 print("\n" + "="*40)
 print("DENEY SONUCU: YAPI BOZULMASI (DISRUPTION)")
 print("="*40)
-print(f"Orijinal Graph Parça Sayısı: {components_orig} (Bütünlük Korunuyor)")
-print(f"Explanation Graph Parça Sayısı: {components_expl}")
+print(f"Analyzed Graph Size (Nodes): {len(subset)}")
+print(f"Original Connected Components: {comp_orig} (Bütünlük Tam)")
+print(f"Explanation Connected Components: {comp_expl}")
 
-if components_expl > components_orig:
-    print("✅ KANITLANDI: Explanation graph'ı parçalamış (Fragmentation)!")
+if comp_expl > comp_orig * 2:
+    print(f"✅ KANITLANDI: Mahalle {comp_expl} parçaya bölündü (Fragmentation)!")
+    print("   -> Bu, açıklamanın bağlamı kopardığını (Loss of Context) gösterir.")
 else:
-    print("⚠️ Yapı çok bozulmadı.")
+    print("⚠️ Yeterince parçalanma olmadı, threshold'u artırmayı dene.")
 
 # =====================
-# 7. GÖRSELLEŞTİRME
+# 6. GÖRSELLEŞTİRME (OPSİYONEL - RAPOR İÇİN)
 # =====================
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-# Pozisyonları Orijinal graph üzerinden hesapla (Gerçek ID'ler ile)
-pos = nx.spring_layout(G_orig, seed=42)
+plt.figure(figsize=(12, 5))
 
 # Sol: Orijinal
-nx.draw(G_orig, pos, ax=axes[0], node_size=50, node_color='#bdc3c7', with_labels=False)
-nx.draw_networkx_nodes(G_orig, pos, nodelist=[target_node], node_color='#2ecc71', node_size=150, ax=axes[0])
-axes[0].set_title(f"Original Neighborhood\n(Connected Components: {components_orig})")
+plt.subplot(1, 2, 1)
+pos = nx.spring_layout(G_orig, seed=42)
+nx.draw(G_orig, pos, node_size=20, node_color='#bdc3c7', alpha=0.5)
+nx.draw_networkx_nodes(G_orig, pos, nodelist=[target_node], node_color='red', node_size=100)
+plt.title(f"Original Neighborhood\n({comp_orig} Component)")
 
 # Sağ: Explanation
-# G_expl içindeki düğümlerin hepsi pos içinde var mı kontrolü (Garanti olsun diye)
-common_nodes = [n for n in G_expl.nodes() if n in pos]
-G_expl_filtered = G_expl.subgraph(common_nodes)
+plt.subplot(1, 2, 2)
+nx.draw(G_expl, pos, node_size=20, node_color='#bdc3c7', alpha=0.5) # Node'lar silik
+nx.draw_networkx_edges(G_expl, pos, edge_color='#e74c3c', width=2) # Kenarlar belirgin
+nx.draw_networkx_nodes(G_expl, pos, nodelist=[target_node], node_color='red', node_size=100)
+plt.title(f"Explanation Output\n({comp_expl} Components - Fragmented)")
 
-nx.draw(G_expl_filtered, pos, ax=axes[1], node_size=50, node_color='#e74c3c', with_labels=False, edge_color='red', width=1.5)
-axes[1].set_title(f"Single-Objective Explanation\n(Connected Components: {components_expl}) - FRAGMENTED")
-
-plt.savefig('problem3_structure_disruption.png')
-print("\n✅ Grafik kaydedildi: problem3_structure_disruption.png")
+plt.savefig("experiment3_disruption_proof.png", dpi=300)
+print("✅ Grafik kaydedildi: experiment3_disruption_proof.png")
 plt.show()

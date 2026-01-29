@@ -7,9 +7,6 @@ from torch_geometric.data import Data
 JSON_PATH = "Office_Products_5.json"  
 GRAPH_SAVE_PATH = "amazon_office_graph.pt"
 
-
-
-
 def load_amazon_json(path):
     data = []
     with open(path, "r") as f:
@@ -43,8 +40,6 @@ print("After removing neutral reviews:", len(df))
 
 df = df[["reviewerID", "asin", "overall", "label", "helpful"]]
 
-
-
 user_ids = df["reviewerID"].unique()
 product_ids = df["asin"].unique()
 
@@ -55,8 +50,6 @@ num_nodes = len(user_ids) + len(product_ids)
 print("Users:", len(user_ids))
 print("Products:", len(product_ids))
 print("Total nodes:", num_nodes)
-
-
 
 edges = []
 edge_weights = []
@@ -80,8 +73,6 @@ edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 edge_attr = torch.tensor(edge_weights, dtype=torch.float)
 
 print("Total edges:", edge_index.shape[1])
-
-
 
 x = torch.zeros((num_nodes, 2))
 

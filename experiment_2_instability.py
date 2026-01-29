@@ -75,7 +75,6 @@ def get_top_k_edges(node_idx, seed, k=20):
     explanation = explainer(data.x, data.edge_index, index=node_idx)
     scores = explanation.edge_mask
     
-    # En yüksek K tanesini al
     topk_values, topk_indices = torch.topk(scores, k)
     return set(topk_indices.cpu().numpy())
 
@@ -91,7 +90,6 @@ for i in range(max_tries):
     node_idx = candidates[torch.randint(0, len(candidates), (1,)).item()].item()
     print(f"Deneme {i+1}: Node {node_idx} taranıyor...")
     
-    # Run 1 vs Run 2
     edges1 = get_top_k_edges(node_idx, seed=42, k=20)
     edges2 = get_top_k_edges(node_idx, seed=99, k=20)
     
